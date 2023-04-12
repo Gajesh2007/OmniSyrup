@@ -45,10 +45,19 @@ contract SmartChef is NonblockingLzApp, ReentrancyGuard {
 
     // Info of each user that stakes tokens (stakedToken)
     mapping(address => UserInfo) public userInfo;
+    // Info of each chain that is allowed / not allowed
+    mapping (uint256 => ChainDetails) public srcDetails;
 
     struct UserInfo {
         uint256 amount; // How many staked tokens the user has provided
         uint256 rewardDebt; // Reward debt
+    }
+
+    struct ChainDetails {
+        address allowedAddress; // address of the source chain
+        bool activated;         // status if the chain is activated
+        uint256 feeForDeposit;  // fee for deposit
+        uint256 feeForWithdraw; // fee for withdraw
     }
 
     event AdminTokenRecovery(address tokenRecovered, uint256 amount);
@@ -140,11 +149,13 @@ contract SmartChef is NonblockingLzApp, ReentrancyGuard {
      * @param _amount: amount to deposit (in depositToken)
      * @param _user: user address
      */
-    function omniDeposit(uint256 _amount, address _user) internal nonReentrant {
+    function omniDeposit(uint256 _amount, address _user) internal returns (bool) {
         UserInfo storage user = userInfo[_user];
 
         if (hasUserLimit) {
-            require(_amount.add(user.amount) <= poolLimitPerUser, "User amount above limit");
+            if (!(_amount.add(user.amount) <= poolLimitPerUser)) {
+                return false;
+            }
         }
 
         _updatePool();
@@ -152,7 +163,9 @@ contract SmartChef is NonblockingLzApp, ReentrancyGuard {
         if (user.amount > 0) {
             uint256 pending = user.amount.mul(accTokenPerShare).div(PRECISION_FACTOR).sub(user.rewardDebt);
             if (pending > 0) {
-                rewardToken.safeTransfer(address(_user), pending);
+                if (!rewardToken.transfer(address(_user), pending)) {
+                    return false;
+                } 
             }
         }
 
@@ -195,7 +208,7 @@ contract SmartChef is NonblockingLzApp, ReentrancyGuard {
      * @notice Withdraw staked tokens and collect reward tokens
      * @param _amount: amount to withdraw
      */
-    function omniWithdraw(uint256 _amount, address _user) internal nonReentrant {
+    function omniWithdraw(uint256 _amount, address _user) internal {
         UserInfo storage user = userInfo[_user];
         require(user.amount >= _amount, "Amount to withdraw too high");
 
@@ -369,22 +382,59 @@ contract SmartChef is NonblockingLzApp, ReentrancyGuard {
         }
     }
 
+    /// @notice LayerZero Function For Receive Messages From Destination Address
+    /// @param _srcChainId: chain id of the sending chain
+    /// @param _srcAddress: the sending address
+    /// @param _nonce: nonce of the message
+    /// @param _payload: the message
     function _nonblockingLzReceive(
         uint16 _srcChainId, 
         bytes memory _srcAddress, 
         uint64 _nonce, 
         bytes memory _payload
     ) internal override {
-        address srcAddress;
+        address extractedAddress;
         assembly {
-            srcAddress := mload(add(_srcAddress, 20))
+            extractedAddress := mload(add(_srcAddress, 20))
         }
 
-        // require(srcAddress == destination, "not sent by destination contract");
+        (string memory message, address userAddress, uint256 amount) = abi.decode(_payload, (string, address, uint256));
 
-        (address _user, uint256 _amountToSend) = abi.decode(_payload, (address, uint256));
+        if (keccak256(bytes(message)) == keccak256(bytes("deposit"))) {
+            require(srcDetails[_srcChainId].activated == true, "this chain is not allowed");
+            require(extractedAddress == srcDetails[_srcChainId].allowedAddress, "requests are not allowed from this address");
+            
+            if (omniDeposit(amount, userAddress)) {
+                bytes memory data = abi.encode("deposit_fail", msg.sender, amount);
 
-        payable(_user).transfer(_amountToSend);
+                _lzSend(
+                    _srcChainId, 
+                    data, 
+                    payable(msg.sender), 
+                    address(0x0), 
+                    bytes(""),
+                    srcDetails[_srcChainId].feeForDeposit
+                );
+            }
+        } else if (keccak256(bytes(message)) == keccak256(bytes("withdraw"))) {
+            require(srcDetails[_srcChainId].activated == true, "this chain is not allowed");
+            require(extractedAddress == srcDetails[_srcChainId].allowedAddress, "requests are not allowed from this address");
+
+            omniWithdraw(amount, userAddress);
+
+            bytes memory data = abi.encode(msg.sender, amount);
+
+            _lzSend(
+                _srcChainId, 
+                data, 
+                payable(msg.sender), 
+                address(0x0), 
+                bytes(""),
+                srcDetails[_srcChainId].feeForWithdraw
+            );
+        } else if (keccak256(bytes(message)) == keccak256(bytes("claim"))) {
+            omniDeposit(0, userAddress);
+        }
     }
 
 }

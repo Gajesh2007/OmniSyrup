@@ -9,37 +9,36 @@ import "../node_modules/@openzeppelin/contracts/access/Ownable.sol";
 contract Source is NonblockingLzApp {
     using SafeMath for uint256;
 
-    uint256 constant MAX_INT = 115792089237316195423570985008687907853269984665640564039457584007913129639935;
-
     // Address of Destination contract where all the money will be sent
     address public destination;
-    // Price for each NFT
-    uint256 public constant price = 50000000000000000; // 0.05 ETH
-    // Maximum amount of NFTs mintable in one transaction
-    uint public constant maxPurchase = 5;
+    // Whether a limit is set for users
+    bool public hasUserLimit;
     // Chain id of Destination Chain
     uint16 public dstChainId;
-    // WETH
-    IERC20 public weth;
+    // The token being staked -- CAKE
+    IERC20 public stakedToken;
 
+    /// @notice Constructor
+    /// @param _lzEndpoint: LayerZero Endpoint
+    /// @param _dstChainId: Chain Id of the destination address
+    /// @param _stakedToken: The token being staked
     constructor(
         address _lzEndpoint,
         uint16 _dstChainId,
-        address _weth
+        address _stakedToken
     ) NonblockingLzApp(_lzEndpoint) {
         dstChainId = _dstChainId;
-        weth = WETH(_weth);
+        stakedToken = IERC20(_stakedToken);
     }
 
-    function omniMint(uint256 _amount) public payable {
-        require(_amount > 0 && _amount <= maxPurchase, "Can only mint 5 NFTs at a time");
-        uint256 cost = _amount.mul(price);
+    /// @notice function to deposit stakedToken remotely
+    /// @param _amount: the amount of tokens being deposited
+    function omniDeposit(uint256 _amount) public payable {
         require(msg.value > 0, "stargate requires fee to pay crosschain message");
 
-        weth.transferFrom(msg.sender, address(this), cost);
-        weth.withdraw(weth.balanceOf(address(this)));
+        stakedToken.transferFrom(msg.sender, address(this), _amount);
         
-        bytes memory data = abi.encode(msg.sender, _amount);
+        bytes memory data = abi.encode("deposit", msg.sender, _amount);
         
         _lzSend(
             dstChainId, 
@@ -51,13 +50,12 @@ contract Source is NonblockingLzApp {
         );
     }
 
-
-    function omniMintNative(uint256 _amount, uint256 _fee) public payable {
-        require(_amount > 0 && _amount <= maxPurchase, "Can only mint 5 NFTs at a time");
-        uint256 cost = _amount.mul(price);
-        require(msg.value > (cost + _fee), "eth is not enough");
+    /// @notice function to withdraw stakedToken remotely
+    /// @param _amount: the amount of tokens being withdrawn
+    function omniWithdraw(uint256 _amount) public payable {
+        require(msg.value > 0, "stargate requires fee to pay crosschain message");
         
-        bytes memory data = abi.encode(msg.sender, _amount);
+        bytes memory data = abi.encode("withdraw", msg.sender, _amount);
         
         _lzSend(
             dstChainId, 
@@ -65,10 +63,31 @@ contract Source is NonblockingLzApp {
             payable(msg.sender), 
             address(0x0), 
             bytes(""),
-            _fee
+            msg.value
         );
     }
 
+    /// @notice function to claim reward remotely
+    function omniClaim() public payable {
+        require(msg.value > 0, "stargate requires fee to pay crosschain message");
+        
+        bytes memory data = abi.encode("claim", msg.sender, 0);
+        
+        _lzSend(
+            dstChainId, 
+            data, 
+            payable(msg.sender), 
+            address(0x0), 
+            bytes(""),
+            msg.value
+        );
+    }
+
+    /// @notice LayerZero Function For Receive Messages From Destination Address
+    /// @param _srcChainId: chain id of the sending chain
+    /// @param _srcAddress: the sending address
+    /// @param _nonce: nonce of the message
+    /// @param _payload: the message
     function _nonblockingLzReceive(
         uint16 _srcChainId, 
         bytes memory _srcAddress, 
@@ -80,12 +99,18 @@ contract Source is NonblockingLzApp {
             srcAddress := mload(add(_srcAddress, 20))
         }
 
+        // message can be only sent by `destination` contract
         require(srcAddress == destination, "not sent by destination contract");
 
-        (address _user, uint256 _amountToSend) = abi.decode(_payload, (address, uint256));
+        /// @param message: the message
+        /// @param userAddress: address of the user
+        /// @param amount: amount of tokens being withdrawn or refunded
+        (string memory message, address userAddress, uint256 amount) = abi.decode(_payload, (string, address, uint256));
 
-        payable(_user).transfer(_amountToSend);
+        if (keccak256(bytes(message)) == keccak256(bytes("deposit_fail"))) {
+            stakedToken.transfer(userAddress, amount);
+        } else if (keccak256(bytes(message)) == keccak256(bytes("withdraw"))) {
+            stakedToken.transfer(userAddress, amount);
+        }
     }
-
-    receive() external payable {}
 }
